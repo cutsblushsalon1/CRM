@@ -23,6 +23,28 @@ export async function middleware(request: NextRequest) {
     }
   )
 
+  // Public v1 API — authenticated by `Authorization: Bearer <api key>`,
+  // not cookies, so wildcard CORS is safe (a third-party site can't
+  // forge that header the way it can ride along cookies). This is what
+  // lets a browser-based caller — e.g. the Salon Billing app's invoice
+  // sender — hit /api/v1/messages directly from its own origin instead
+  // of needing its own backend proxy. Handled before the Supabase
+  // session lookup below since API-key routes don't use it.
+  if (request.nextUrl.pathname.startsWith('/api/v1/')) {
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    }
+    if (request.method === 'OPTIONS') {
+      return new NextResponse(null, { status: 204, headers: corsHeaders })
+    }
+    const passthrough = NextResponse.next({ request })
+    Object.entries(corsHeaders).forEach(([key, value]) => passthrough.headers.set(key, value))
+    return passthrough
+  }
+
   const { data: { user } } = await supabase.auth.getUser()
 
   // getUser() transparently refreshes an expired access token, which
