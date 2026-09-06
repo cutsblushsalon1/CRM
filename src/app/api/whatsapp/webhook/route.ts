@@ -246,11 +246,15 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const value = change.value
 
-      // Handle status updates
+      // Handle status updates. Meta batches many recipients' statuses
+      // into one webhook call — a broadcast to 50 people can arrive as
+      // 50 entries here in a single request. Each touches a distinct
+      // message_id with no ordering dependency on the others, so they
+      // run concurrently rather than one at a time (which used to turn
+      // one broadcast's delivery into 50 sequential round-trip chains
+      // inside a single function invocation).
       if (value.statuses) {
-        for (const status of value.statuses) {
-          await handleStatusUpdate(status)
-        }
+        await Promise.all(value.statuses.map((status) => handleStatusUpdate(status)))
       }
 
       // Handle incoming messages
@@ -370,28 +374,45 @@ async function handleStatusUpdate(status: {
   timestamp: string
   recipient_id: string
 }) {
-  // 1) Mirror onto messages (legacy behavior) — Meta's status values
-  //    already match the CHECK constraint on messages.status. No
-  //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
-  //    repeat across numbers), so this updates 0..N rows and must not
-  //    assume a single row.
-  const { error: msgErr } = await supabaseAdmin()
-    .from('messages')
-    .update({ status: status.status })
-    .eq('message_id', status.id)
+  // These three branches touch different tables and none reads another's
+  // result, so they run concurrently rather than one after another. This
+  // fires on every delivery-status callback Meta sends (pending → sent →
+  // delivered → read — up to 4 per outbound message), so it's one of the
+  // hottest paths through this webhook; serializing three independent
+  // round-trips here multiplied that cost for no reason.
+  await Promise.all([
+    // 1) Mirror onto messages (legacy behavior) — Meta's status values
+    //    already match the CHECK constraint on messages.status. No
+    //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
+    //    repeat across numbers), so this updates 0..N rows and must not
+    //    assume a single row.
+    supabaseAdmin()
+      .from('messages')
+      .update({ status: status.status })
+      .eq('message_id', status.id)
+      .then(({ error }) => {
+        if (error) console.error('Error updating message status:', error)
+      }),
 
-  if (msgErr) {
-    console.error('Error updating message status:', msgErr)
-  }
+    // 2) Mirror onto broadcast_recipients via whatsapp_message_id
+    //    (added in migration 003). The aggregate trigger on
+    //    broadcast_recipients re-derives the parent broadcast's
+    //    sent/delivered/read/failed counts automatically.
+    mirrorBroadcastRecipientStatus(status),
 
-  // Webhook fan-out for this status change happens at the END of this
-  // handler (after the broadcast mirror below), so a slow subscriber
-  // endpoint can't delay the broadcast_recipients update.
+    // 3) Webhook fan-out for messages we store (inbox / API sends).
+    //    Bounded to one row (message_id isn't unique) purely to resolve
+    //    the owning account for delivery. A slow subscriber endpoint
+    //    can't delay the two mirrors above since all three run together.
+    dispatchStatusWebhook(status),
+  ])
+}
 
-  // 2) Mirror onto broadcast_recipients via whatsapp_message_id
-  //    (added in migration 003). The aggregate trigger on
-  //    broadcast_recipients re-derives the parent broadcast's
-  //    sent/delivered/read/failed counts automatically.
+async function mirrorBroadcastRecipientStatus(status: {
+  id: string
+  status: string
+  timestamp: string
+}) {
   const tsIso = new Date(parseInt(status.timestamp) * 1000).toISOString()
 
   const { data: recipient, error: recFetchErr } = await supabaseAdmin()
@@ -402,31 +423,33 @@ async function handleStatusUpdate(status: {
 
   if (recFetchErr) {
     console.error('Error fetching broadcast recipient:', recFetchErr)
-  } else if (
-    recipient &&
+    return
+  }
+  if (
+    !recipient ||
     // Guard transitions — forward-only on the success ladder, and
     // `failed` only from pre-delivered states.
-    isValidStatusTransition(recipient.status, status.status)
+    !isValidStatusTransition(recipient.status, status.status)
   ) {
-    const update: Record<string, unknown> = { status: status.status }
-    if (status.status === 'sent' && !('sent_at' in update)) update.sent_at = tsIso
-    if (status.status === 'delivered') update.delivered_at = tsIso
-    if (status.status === 'read') update.read_at = tsIso
-
-    const { error: recUpdateErr } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .update(update)
-      .eq('id', recipient.id)
-
-    if (recUpdateErr) {
-      console.error('Error updating broadcast recipient status:', recUpdateErr)
-    }
+    return
   }
 
-  // 3) Webhook fan-out for messages we store (inbox / API sends).
-  //    Runs last so a slow subscriber can't delay the mirrors above.
-  //    Bounded to one row (message_id isn't unique) purely to resolve
-  //    the owning account for delivery.
+  const update: Record<string, unknown> = { status: status.status }
+  if (status.status === 'sent' && !('sent_at' in update)) update.sent_at = tsIso
+  if (status.status === 'delivered') update.delivered_at = tsIso
+  if (status.status === 'read') update.read_at = tsIso
+
+  const { error: recUpdateErr } = await supabaseAdmin()
+    .from('broadcast_recipients')
+    .update(update)
+    .eq('id', recipient.id)
+
+  if (recUpdateErr) {
+    console.error('Error updating broadcast recipient status:', recUpdateErr)
+  }
+}
+
+async function dispatchStatusWebhook(status: { id: string; status: string }) {
   const { data: msgRow } = await supabaseAdmin()
     .from('messages')
     .select('conversation_id, conversations(account_id)')
@@ -434,22 +457,21 @@ async function handleStatusUpdate(status: {
     .limit(1)
     .maybeSingle()
 
-  if (msgRow) {
-    const conv = msgRow.conversations as { account_id: string } | null
-    const accountId = conv?.account_id
-    if (accountId) {
-      await dispatchWebhookEvent(
-        supabaseAdmin(),
-        accountId,
-        'message.status_updated',
-        {
-          whatsapp_message_id: status.id,
-          conversation_id: msgRow.conversation_id,
-          status: status.status,
-        }
-      )
+  if (!msgRow) return
+  const conv = msgRow.conversations as { account_id: string } | null
+  const accountId = conv?.account_id
+  if (!accountId) return
+
+  await dispatchWebhookEvent(
+    supabaseAdmin(),
+    accountId,
+    'message.status_updated',
+    {
+      whatsapp_message_id: status.id,
+      conversation_id: msgRow.conversation_id,
+      status: status.status,
     }
-  }
+  )
 }
 
 /**
@@ -766,48 +788,51 @@ async function processMessage(
 
   // If this contact was a recent broadcast recipient, flag the reply
   // so the broadcast's `replied_count` advances (via the aggregate
-  // trigger installed in migration 003).
-  await flagBroadcastReplyIfAny(accountId, contactRecord.id)
-
-  // ============================================================
-  // Flow runner dispatch.
-  //
-  // If the runner consumes the message (it either advanced an active
-  // run or started a new one), we suppress the `new_message_received`
-  // + `keyword_match` automation triggers for this inbound. Customer
-  // is navigating the bot menu, not sending a fresh trigger word
-  // that should fork into automations.
-  //
-  // The relationship-level triggers (`new_contact_created`,
-  // `first_inbound_message`) still fire even when consumed — those
-  // are about WHO is messaging, not what they said.
-  //
-  // Awaited (not fire-and-forget) because we need the `consumed`
-  // result before deciding whether to dispatch automations. The
-  // runner has its own try/catch and never throws. Accounts with
-  // no active flows take the runner's early-exit "no_match" path
-  // basically for free (one indexed SELECT for the active run).
-  // ============================================================
-  const flowResult = await dispatchInboundToFlows({
-    accountId,
-    userId: configOwnerUserId,
-    contactId: contactRecord.id,
-    conversationId: conversation.id,
-    message:
-      interactiveReplyId
-        ? {
-            kind: 'interactive_reply',
-            reply_id: interactiveReplyId,
-            reply_title: contentText ?? '',
-            meta_message_id: message.id,
-          }
-        : {
-            kind: 'text',
-            text: contentText ?? message.text?.body ?? '',
-            meta_message_id: message.id,
-          },
-    isFirstInboundMessage,
-  })
+  // trigger installed in migration 003). Runs concurrently with the
+  // flow dispatch below — neither reads the other's result, so there's
+  // no reason to pay for two round-trips back to back.
+  const [, flowResult] = await Promise.all([
+    flagBroadcastReplyIfAny(accountId, contactRecord.id),
+    // ============================================================
+    // Flow runner dispatch.
+    //
+    // If the runner consumes the message (it either advanced an active
+    // run or started a new one), we suppress the `new_message_received`
+    // + `keyword_match` automation triggers for this inbound. Customer
+    // is navigating the bot menu, not sending a fresh trigger word
+    // that should fork into automations.
+    //
+    // The relationship-level triggers (`new_contact_created`,
+    // `first_inbound_message`) still fire even when consumed — those
+    // are about WHO is messaging, not what they said.
+    //
+    // Awaited (not fire-and-forget) because we need the `consumed`
+    // result before deciding whether to dispatch automations. The
+    // runner has its own try/catch and never throws. Accounts with
+    // no active flows take the runner's early-exit "no_match" path
+    // basically for free (one indexed SELECT for the active run).
+    // ============================================================
+    dispatchInboundToFlows({
+      accountId,
+      userId: configOwnerUserId,
+      contactId: contactRecord.id,
+      conversationId: conversation.id,
+      message:
+        interactiveReplyId
+          ? {
+              kind: 'interactive_reply',
+              reply_id: interactiveReplyId,
+              reply_title: contentText ?? '',
+              meta_message_id: message.id,
+            }
+          : {
+              kind: 'text',
+              text: contentText ?? message.text?.body ?? '',
+              meta_message_id: message.id,
+            },
+      isFirstInboundMessage,
+    }),
+  ])
   const flowConsumed = flowResult.consumed
 
   // Fire any automations that react to this webhook event. All dispatches
@@ -843,57 +868,53 @@ async function processMessage(
   // listens to only one trigger runs only when that trigger matches.
   if (contactOutcome.wasCreated) automationTriggers.unshift('new_contact_created')
   if (isFirstInboundMessage) automationTriggers.unshift('first_inbound_message')
-  // Awaited — not fire-and-forget. We're inside the route's `after()`
-  // block, which only keeps the function alive for promises it can see, so
-  // a detached dispatch can be frozen part-way through: the log row is
-  // inserted, then the steps never run. That is issue #301's failure mode
-  // recurring one level down, and it's what issue #409 reported as runs
-  // logging zero steps. `runAutomationsForTrigger` owns its own try/catch
-  // and never throws; the `.catch` is belt-and-braces so one trigger
-  // type's failure can't skip the rest of the loop.
-  for (const triggerType of automationTriggers) {
-    await runAutomationsForTrigger({
-      accountId,
-      triggerType,
-      contactId: contactRecord.id,
-      context: {
-        message_text: inboundText,
-        conversation_id: conversation.id,
-        // Only set on interactive taps; drives the interactive_reply
-        // trigger's exact-id match.
-        interactive_reply_id: interactiveReplyId ?? undefined,
-      },
-    }).catch((err) => console.error('[automations] dispatch failed:', err))
-  }
+  // Awaited (not fire-and-forget, for the same #301/#409 reason as the
+  // flow runner above) but run CONCURRENTLY, not one at a time: each
+  // trigger type is an independent lookup + dispatch that doesn't
+  // depend on any other trigger's result, so there's no reason to pay
+  // N sequential round-trips when the account has, say, an unrelated
+  // "first_inbound_message" automation and a "keyword_match" one. Each
+  // call already owns its own try/catch and never throws; the .catch
+  // here is belt-and-braces so one failing trigger can't reject the
+  // Promise.all and skip logging the rest.
+  await Promise.all(
+    automationTriggers.map((triggerType) =>
+      runAutomationsForTrigger({
+        accountId,
+        triggerType,
+        contactId: contactRecord.id,
+        context: {
+          message_text: inboundText,
+          conversation_id: conversation.id,
+          // Only set on interactive taps; drives the interactive_reply
+          // trigger's exact-id match.
+          interactive_reply_id: interactiveReplyId ?? undefined,
+        },
+      }).catch((err) => console.error('[automations] dispatch failed:', err)),
+    ),
+  )
 
-  // AI auto-reply. Runs only for plain-text inbound the deterministic
-  // flow runner did NOT consume (flows win over the LLM), and only when
-  // the account has enabled it. Awaited inside `after()` (same reason as
-  // the webhook dispatch below); `dispatchInboundToAiReply` owns its
-  // eligibility gates + try/catch and never throws.
-  if (!flowConsumed && !interactiveReplyId && inboundText.trim()) {
-    await dispatchInboundToAiReply({
-      accountId,
-      conversationId: conversation.id,
-      contactId: contactRecord.id,
-      configOwnerUserId,
-    })
-  }
-
-  // message.received webhook (public API). Awaited — not fire-and-forget
-  // — because we're inside the route's `after()` block, which only keeps
-  // the function alive for promises it can see; a detached promise could
-  // be frozen before it delivers. `dispatchWebhookEvent` early-exits
-  // when the account has no matching endpoint and never throws.
-  // (conversation.created is emitted earlier, right after the thread is
-  // opened.)
-  await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
-    conversation_id: conversation.id,
-    contact_id: contactRecord.id,
-    whatsapp_message_id: message.id,
-    content_type: contentType,
-    text: contentText,
-  })
+  // AI auto-reply and the public message.received webhook are both
+  // independent tail work — neither depends on the other's result —
+  // so they run concurrently rather than back-to-back. Both already
+  // own their eligibility checks / early-exits and never throw.
+  await Promise.all([
+    !flowConsumed && !interactiveReplyId && inboundText.trim()
+      ? dispatchInboundToAiReply({
+          accountId,
+          conversationId: conversation.id,
+          contactId: contactRecord.id,
+          configOwnerUserId,
+        })
+      : Promise.resolve(),
+    dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+      conversation_id: conversation.id,
+      contact_id: contactRecord.id,
+      whatsapp_message_id: message.id,
+      content_type: contentType,
+      text: contentText,
+    }),
+  ])
 }
 
 async function parseMessageContent(
