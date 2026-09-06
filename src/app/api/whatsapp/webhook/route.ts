@@ -386,13 +386,7 @@ async function handleStatusUpdate(status: {
     //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
     //    repeat across numbers), so this updates 0..N rows and must not
     //    assume a single row.
-    supabaseAdmin()
-      .from('messages')
-      .update({ status: status.status })
-      .eq('message_id', status.id)
-      .then(({ error }) => {
-        if (error) console.error('Error updating message status:', error)
-      }),
+    mirrorMessageStatus(status),
 
     // 2) Mirror onto broadcast_recipients via whatsapp_message_id
     //    (added in migration 003). The aggregate trigger on
@@ -406,6 +400,15 @@ async function handleStatusUpdate(status: {
     //    can't delay the two mirrors above since all three run together.
     dispatchStatusWebhook(status),
   ])
+}
+
+async function mirrorMessageStatus(status: { id: string; status: string }) {
+  const { error } = await supabaseAdmin()
+    .from('messages')
+    .update({ status: status.status })
+    .eq('message_id', status.id)
+
+  if (error) console.error('Error updating message status:', error)
 }
 
 async function mirrorBroadcastRecipientStatus(status: {
