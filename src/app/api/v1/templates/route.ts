@@ -2,8 +2,7 @@
 // GET /api/v1/templates — list WhatsApp message templates
 // (scope: templates:read)
 //
-// Lets an external caller (e.g. the Salon Billing app's Follow-ups
-// "sync templates" button) discover which approved templates it can
+// Lets an external caller discover which approved templates it can
 // send by name via POST /api/v1/messages, without ever touching the
 // dashboard. Defaults to APPROVED-only, since a PENDING/REJECTED
 // template can't actually be sent - pass `?status=all` to see
