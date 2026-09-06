@@ -160,25 +160,17 @@ export async function POST(request: Request) {
     }
     const templateRow = resolvedTemplate.row
 
-    const results: BroadcastResult[] = []
-    let sentCount = 0
-    let failedCount = 0
-
-    for (const recipient of recipients) {
+    // Sends to one recipient, trying phone variants in order on a
+    // "not in allowed list" error (a trunk-prefix-0 mismatch). Pulled
+    // out of the loop below so every recipient in the batch can run
+    // through Promise.all instead of one at a time.
+    const sendToRecipient = async (recipient: NewRecipient): Promise<BroadcastResult> => {
       const sanitized = sanitizePhoneForMeta(recipient.phone)
 
       if (!isValidE164(sanitized)) {
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: 'Invalid phone number format',
-        })
-        failedCount++
-        continue
+        return { phone: recipient.phone, status: 'failed', error: 'Invalid phone number format' }
       }
 
-      // Retry with phone variants on "not in allowed list" so numbers
-      // that differ only in a trunk-prefix 0 still reach recipients.
       const variants = phoneVariants(sanitized)
       let sentMessageId: string | null = null
       let lastError: string | null = null
@@ -199,8 +191,7 @@ export async function POST(request: Request) {
           lastError = null
           break
         } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : 'Unknown error'
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error'
           if (!isRecipientNotAllowedError(errorMessage)) {
             lastError = errorMessage
             break
@@ -211,25 +202,26 @@ export async function POST(request: Request) {
       }
 
       if (sentMessageId) {
-        results.push({
-          phone: recipient.phone,
-          status: 'sent',
-          whatsapp_message_id: sentMessageId,
-        })
-        sentCount++
-      } else {
-        console.error(
-          `Failed to send broadcast to ${recipient.phone}:`,
-          lastError
-        )
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: lastError || 'Unknown error',
-        })
-        failedCount++
+        return { phone: recipient.phone, status: 'sent', whatsapp_message_id: sentMessageId }
       }
+      console.error(`Failed to send broadcast to ${recipient.phone}:`, lastError)
+      return { phone: recipient.phone, status: 'failed', error: lastError || 'Unknown error' }
     }
+
+    // Every recipient in this (already small, ~10-at-a-time) batch is
+    // sent concurrently rather than one at a time — see RATE_LIMITS.broadcast
+    // above: the caller already batches + paces campaigns, and Meta's
+    // own per-number throughput limit was always the real ceiling, not
+    // this loop, so serializing sends here only cost wall time/CPU.
+    const sendResults = await Promise.all(recipients.map(sendToRecipient))
+
+    let sentCount = 0
+    let failedCount = 0
+    for (const r of sendResults) {
+      if (r.status === 'sent') sentCount++
+      else failedCount++
+    }
+    const results: BroadcastResult[] = sendResults
 
     return NextResponse.json({
       success: true,

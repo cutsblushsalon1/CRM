@@ -7,7 +7,14 @@ import { ImageResponse } from "next/og";
 //
 // This route takes precedence over src/app/favicon.ico, which is the
 // Next.js default and can stay on disk harmlessly (or be removed).
-
+//
+// `force-static`: this image never depends on request data — without
+// it, an ImageResponse route can get treated as dynamic and re-run its
+// Satori font-layout + rasterization pipeline (genuinely CPU-heavy) on
+// every single page load that references the favicon. `force-static`
+// tells Next.js to render this once at build time and serve the same
+// cached bytes forever, so it costs zero compute per request.
+export const dynamic = "force-static";
 export const runtime = "edge";
 export const size = { width: 32, height: 32 };
 export const contentType = "image/png";
